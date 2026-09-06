@@ -1,31 +1,46 @@
 """活跃会话看板：自动铺当前需要盯的托管会话，不写入持久分屏组合。
 
-成员资格与侧栏关注圆点同源：corral 自己托管、且关注态是等待回答 /
-执行中 / 未读新结果（``attention.ATTENTION_MARKER_KINDS``）。别的窗口
-里跑的会话没有实时画面，不进格子。超过一页时当前页成员冻结，
-新急件排到后面；格子空出来才从队列按优先级补位。**正在看看板期间
-当前页成员不主动撤**：只要会话仍被 corral 托管，跑完、已读都继续
-钉在原格，直到离开看板、显式关格或会话不再托管；显式翻页按当时的
-队列重切，不在队列里的成员随之让位。角标人数只计仍带关注圆点的成员，
-钉住已消退的格不虚高。
+成员资格（权威口径）：corral 自己托管、且关注态是等待回答 / 执行中 /
+未读新结果，或「刚刚」（与侧栏时间行同一条 3 分钟界）内还有真实对话活动。
+侧栏关注圆点必须覆盖同一集合（``resolve_active_marker``），缺圆点时补圆点，
+禁止反过来砍掉看板成员。别的窗口里跑的会话没有实时画面，不进格子。
+超过一页时当前页成员冻结，新急件排到后面；格子空出来才从队列按优先级补位。
+**正在看看板期间当前页成员不主动撤**：只要会话仍被 corral 托管，跑完、已读、
+不再活跃都继续钉在原格，直到离开看板、显式关格或会话不再托管；显式翻页按
+当时的队列重切，不在队列里的成员随之让位。
 """
 
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
+from typing import Literal
 
-from corral.attention import (
-    ATTENTION_MARKER_KINDS,
-    AttentionKind,
-    AttentionState,
-    attention_marker_rank,
-    has_attention_marker,
-)
+from corral.attention import AttentionKind, AttentionState
+from corral.display import JUST_NOW_SECONDS
 from corral.split_layout import MAX_PANES
 
-# 兼容旧调用方：看板成员种类 ≡ 关注圆点种类。
-BOARD_KINDS: frozenset[AttentionKind] = ATTENTION_MARKER_KINDS
+BOARD_KINDS: frozenset[AttentionKind] = frozenset({"waiting", "working", "unread"})
+# 界面圆点 / 看板排序共用的活跃标记（含「刚刚」青点）。
+ActiveMarker = Literal["waiting", "working", "unread", "recent"]
+ACTIVE_MARKER_STYLES: dict[str, str] = {
+    "waiting": "bold yellow",
+    "working": "bold green",
+    "unread": "bold red",
+    # 「刚刚」仍活跃、但没有待办信号：青色，排在三档待办之后。
+    "recent": "bold cyan",
+}
+_KIND_RANK: dict[str, int] = {
+    "waiting": 0,
+    "working": 1,
+    "unread": 2,
+    "recent": 3,
+    "none": 3,
+}
+# 「刚刚还在活跃」与侧栏时间行「刚刚」共用同一条界（display.JUST_NOW_SECONDS）
+# 和同一时间源（会话最近真实活动时间）：侧栏显示「刚刚」的托管会话，看板也认活跃。
+RECENT_ACTIVE_SECONDS = JUST_NOW_SECONDS
 
 
 @dataclass(frozen=True)
@@ -33,7 +48,7 @@ class BoardCandidate:
     """一条够格进看板的托管会话。"""
 
     key: str
-    kind: AttentionKind
+    kind: ActiveMarker
     updated_at: float = 0.0
 
 
@@ -49,16 +64,67 @@ class BoardSnapshot:
     waiting_total: int
 
 
-def collect_candidates(store, now: float | None = None) -> list[BoardCandidate]:
-    """从会话库收集够格的托管会话，按「等回话 > 干活 > 未读」排。
+def resolve_active_marker(
+    session: dict | None = None,
+    *,
+    attention_kind: str | None = None,
+    hosted: bool | None = None,
+    mtime: float | None = None,
+    now: float | None = None,
+) -> ActiveMarker | None:
+    """Active sessions 与侧栏圆点的共用判定。
 
-    ``now`` 保留给调用方兼容，成员资格不再看墙钟「刚刚」窗口——
-    那条旁路曾让 Active sessions 人数比带圆点的会话更多。
+    - 等回话 / 干活 / 未读 → 对应黄 / 绿 / 红（不要求本窗口托管，外部会话也可画点）
+    - 本窗口托管且「刚刚」窗口内仍有活动、但无待办信号 → ``recent``（青点）
+    - 否则无标记
+
+    Active sessions 看板只收录本窗口托管成员；圆点用同一函数，保证凡进 Active
+    的会话侧栏都有点。禁止为对齐而去掉 ``recent`` 档。
     """
-    del now  # 成员资格与圆点同源，不再用墙钟旁路。
+    if session is not None:
+        if attention_kind is None:
+            attention_kind = session.get("attention_kind")
+        if hosted is None:
+            hosted = bool(session.get("keepalive_name"))
+        if mtime is None:
+            mtime = float(session.get("mtime") or 0.0)
+    kind = str(attention_kind or "none")
+    if kind in BOARD_KINDS:
+        return kind  # type: ignore[return-value]
+    if not hosted:
+        return None
+    if now is None:
+        now = time.time()
+    stamp = float(mtime or 0.0)
+    # 未来时间 / 时钟漂移出的负差值按刚刚活跃处理（与 display 的相对时间同规则）。
+    if not stamp or now - stamp > RECENT_ACTIVE_SECONDS:
+        return None
+    return "recent"
+
+
+def active_marker_style(marker: str | None) -> str | None:
+    """圆点 Rich 样式；无标记时返回 None（不留占位空格）。"""
+    if not marker:
+        return None
+    return ACTIVE_MARKER_STYLES.get(str(marker))
+
+
+def active_marker_rank(marker: str | None) -> int:
+    """看板排序：等回话 > 干活 > 未读 > 刚刚活跃。"""
+    return _KIND_RANK.get(str(marker or "none"), 9)
+
+
+def collect_candidates(store, now: float | None = None) -> list[BoardCandidate]:
+    """从会话库收集够格的托管会话，按「等回话 > 干活 > 未读 > 刚刚活跃」排。
+
+    「刚刚活跃」档没有待办信号：会话最近真实活动（mtime，与侧栏「刚刚」文案
+    同源）还在 ``RECENT_ACTIVE_SECONDS`` 窗口内即算。
+    """
     import corral
     from corral.models import is_shell_session
 
+    if now is None:
+        now = time.time()
     candidates: list[BoardCandidate] = []
     for session in store.all_sessions():
         if is_shell_session(session):
@@ -67,18 +133,24 @@ def collect_candidates(store, now: float | None = None) -> list[BoardCandidate]:
             continue
         key = corral.session_key(session)
         state: AttentionState = store.attention_for(key)
-        if not has_attention_marker(state.kind):
-            continue
         mtime = float(session.get("mtime") or 0.0)
+        marker = resolve_active_marker(
+            attention_kind=state.kind,
+            hosted=True,
+            mtime=mtime,
+            now=now,
+        )
+        if marker is None:
+            continue
         candidates.append(
             BoardCandidate(
                 key=key,
-                kind=state.kind,  # type: ignore[arg-type]
+                kind=marker,
                 updated_at=max(state.updated_at, mtime),
             )
         )
     candidates.sort(
-        key=lambda item: (attention_marker_rank(item.kind), -item.updated_at, item.key)
+        key=lambda item: (active_marker_rank(item.kind), -item.updated_at, item.key)
     )
     return candidates
 
@@ -173,12 +245,9 @@ class ActivityBoard:
         """按「当前页不插队、空位才补」更新锁定成员，返回这一帧快照。
 
         正在看看板期间不主动撤格：当前页成员只要仍在 ``hosted_keys`` 里
-        就保留，即使关注态已经消退（跑完、已读）。撤格只发生在
+        就保留，即使关注态已经消退（跑完、已读、不再活跃）。撤格只发生在
         离开看板（``reset``）、显式关格（``dismiss``）、会话不再被托管，
         或显式翻页按当前队列重切时。
-
-        角标 ``total`` 只计仍带关注圆点的成员，与侧栏圆点强一致；钉住
-        已消退的格可以留在右栏，但不虚高人数。
 
         补位不得把更前页的人拉进本页：队头新插进来的急件算前页，
         翻到后页后空位只从本页已有成员之后的队列取。
@@ -237,12 +306,13 @@ class ActivityBoard:
             self._locked = kept
 
         visible = tuple(self._locked)
+        # 被钉住的「已不够格但仍托管」成员也计入角标总数，否则侧栏会话数
+        # 与右栏实际格子数对不上；打字钉住的格子沿用旧口径不计入。
         held = [
             key for key in visible
             if key not in eligible_set and key != typing
         ]
-        # 角标与圆点同源：只计够格（仍带关注圆点）的成员。
-        total = len(eligible)
+        total = len(eligible) + len(held)
         page_count = max(1, math.ceil(total / MAX_PANES)) if total else 1
         if self._page >= page_count:
             if held:

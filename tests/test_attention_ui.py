@@ -135,6 +135,36 @@ class SessionAttentionCardTests(unittest.TestCase):
 
         self.assertNotIn("●", self._render("none").plain)
 
+    def test_recent_hosted_just_now_gets_cyan_dot(self) -> None:
+        """Active sessions 的「刚刚」档在侧栏必须有青点，不得只认三态待办。"""
+        runtime = mock.Mock(id="claude", display_name="Claude")
+        store = mock.Mock()
+        store.registry.get.return_value = runtime
+        session = {
+            "source": "claude",
+            "id": "fresh",
+            "fallback_title": "刚刚还在用",
+            "cwd": "/tmp/corral",
+            "mtime": time.time(),
+            "live": True,
+            "keepalive_name": "corral-claude-fresh",
+            "attention_kind": "none",
+            "attention_token": None,
+            "attention_updated_at": 0.0,
+        }
+        card = SessionCard(session, store, display_title="刚刚还在用")
+        with mock.patch.object(
+            SessionCard, "size", new_callable=mock.PropertyMock, return_value=Size(39, 3),
+        ):
+            rendered = card.render()
+        self.assertIn("●", rendered.plain)
+        dot = rendered.plain.index("●")
+        dot_spans = [span for span in rendered.spans if span.start <= dot < span.end]
+        self.assertTrue(
+            any("cyan" in str(span.style).lower() for span in dot_spans),
+            dot_spans,
+        )
+
     def test_card_keeps_three_lines_fixed_width_and_runtime_right_aligned(self) -> None:
         rendered = self._render("waiting")
         lines = rendered.plain.splitlines()
